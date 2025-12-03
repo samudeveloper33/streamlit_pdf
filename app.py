@@ -125,28 +125,74 @@ def get_paddle_ocr():
 @st.cache_resource
 def get_embedding_model():
     """
-    Initialize the embedding model with fallback options.
+    Initialize a FastEmbed model that is actually supported on this runtime.
+    Also determine embedding dimension dynamically and cache it in session state.
     """
     logger.info("🧠 Initializing embedding model...")
+    supported = []
     try:
-        # Use FastEmbed for faster inference with correct model name
-        model = TextEmbedding(model_name="intfloat/multilingual-e5-small")
-        logger.info("✅ FastEmbed model (intfloat/multilingual-e5-small) loaded successfully")
-        return model
+        supported = TextEmbedding.list_supported_models()
+        logger.info(f"📋 FastEmbed supported models: {supported}")
     except Exception as e:
-        logger.error(f"❌ FastEmbed model loading failed: {str(e)}")
-        logger.info("⚠️ Attempting to load alternative multilingual model...")
-        try:
-            # Fallback to multilingual-e5-base (smaller than large)
-            model = TextEmbedding(model_name="intfloat/multilingual-e5-base")
-            logger.info("✅ Alternative model loaded: intfloat/multilingual-e5-base")
-            return model
-        except Exception as fallback_error:
-            logger.error(f"❌ Alternative model also failed: {str(fallback_error)}")
-            logger.info("⚠️ Using default FastEmbed model...")
+        logger.warning(f"⚠️ Could not list supported FastEmbed models: {e}")
+        supported = []
+
+    # Preference order (we'll match by exact name first, then substring)
+    preferences = [
+        'BAAI/bge-m3',  # multilingual, smallish
+        'bge-m3',
+        'BAAI/bge-small-en-v1.5',
+        'BAAI/bge-base-en-v1.5',
+        'all-MiniLM-L6-v2',
+    ]
+
+    chosen = None
+    if supported:
+        # Exact match
+        for p in preferences:
+            if any(m.lower() == p.lower() for m in supported):
+                chosen = next(m for m in supported if m.lower() == p.lower())
+                break
+        # Substring match
+        if not chosen:
+            for p in preferences:
+                matches = [m for m in supported if p.lower() in m.lower()]
+                if matches:
+                    chosen = matches[0]
+                    break
+        # Fallback to first supported
+        if not chosen:
+            chosen = supported[0]
+
+    try:
+        if chosen:
+            logger.info(f"🧠 Loading FastEmbed model: {chosen}")
+            model = TextEmbedding(model_name=chosen)
+        else:
+            logger.info("🧠 Loading FastEmbed default model (no supported list)")
             model = TextEmbedding()
-            logger.info("✅ Default FastEmbed model loaded")
-            return model
+    except Exception as e:
+        logger.warning(f"⚠️ Could not load chosen/default FastEmbed model: {e}. Falling back to no-arg constructor.")
+        model = TextEmbedding()
+
+    # Determine dimension dynamically
+    try:
+        probe = list(model.embed(["dimension probe"]))
+        dim = len(probe[0]) if probe and hasattr(probe[0], '__len__') else 384
+        st.session_state['embedding_dim'] = int(dim)
+        logger.info(f"✅ FastEmbed ready (dimension: {dim})")
+    except Exception as dim_err:
+        logger.warning(f"⚠️ Could not determine embedding dimension automatically: {dim_err}")
+        st.session_state['embedding_dim'] = EMBEDDING_DIM
+    return model
+
+def get_embedding_dim() -> int:
+    """Return the current embedding dimension detected at runtime."""
+    try:
+        dim = int(st.session_state.get('embedding_dim', EMBEDDING_DIM))
+        return dim if dim > 0 else EMBEDDING_DIM
+    except Exception:
+        return EMBEDDING_DIM
 
 # Initialize models
 paddle_ocr = get_paddle_ocr()
@@ -981,11 +1027,13 @@ def generate_embedding(text: str, task_type: str = "retrieval_document") -> List
         return None
 
 
-def create_qdrant_collection(dimension: int = EMBEDDING_DIM):
+def create_qdrant_collection(dimension: int = None):
     """Create Qdrant collection if it doesn't exist.
     
     Note: FastEmbed intfloat/multilingual-e5-large produces 1024-dimensional embeddings.
     """
+    if dimension is None:
+        dimension = get_embedding_dim()
     if qdrant_client is None:
         logger.error("❌ Qdrant client not initialized")
         st.error("Qdrant client not available")
@@ -1019,16 +1067,16 @@ def create_qdrant_collection(dimension: int = EMBEDDING_DIM):
                 logger.warning(f"⚠️ Could not get collection info: {str(info_error)}")
         
         if not collection_exists:
-            logger.info(f"📦 Creating Qdrant collection '{COLLECTION_NAME}' with dimension {dimension}...")
+            logger.info(f" Creating Qdrant collection '{COLLECTION_NAME}' with dimension {dimension}...")
             try:
                 qdrant_client.create_collection(
                     collection_name=COLLECTION_NAME,
                     vectors_config=VectorParams(size=dimension, distance=Distance.COSINE)
                 )
-                logger.info(f"✅ Collection '{COLLECTION_NAME}' created successfully")
+                logger.info(f" Collection '{COLLECTION_NAME}' created successfully")
                 st.success(f"Created collection: {COLLECTION_NAME} (dimension: {dimension})")
             except Exception as create_error:
-                logger.error(f"❌ Failed to create collection: {str(create_error)}")
+                logger.error(f" Failed to create collection: {str(create_error)}")
                 st.error(f"Failed to create Qdrant collection: {str(create_error)}")
                 return False
         else:
@@ -1063,7 +1111,7 @@ def store_in_qdrant(pdf_name: str, page_number: int, clean_text: str, embedding:
             qdrant_client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
-                    size=EMBEDDING_DIM,
+                    size=get_embedding_dim(),
                     distance=Distance.COSINE
                 )
             )
@@ -1082,14 +1130,15 @@ def store_in_qdrant(pdf_name: str, page_number: int, clean_text: str, embedding:
         try:
             info = qdrant_client.get_collection(collection_name)
             existing_dim = info.config.params.vectors.size
-            if existing_dim != EMBEDDING_DIM:
-                logger.warning(f"⚠️ Dimension mismatch in '{collection_name}': {existing_dim} -> {EMBEDDING_DIM}. Recreating collection.")
+            required_dim = get_embedding_dim()
+            if existing_dim != required_dim:
+                logger.warning(f"⚠️ Dimension mismatch in '{collection_name}': {existing_dim} -> {required_dim}. Recreating collection.")
                 qdrant_client.delete_collection(collection_name)
                 qdrant_client.create_collection(
                     collection_name=collection_name,
-                    vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
+                    vectors_config=VectorParams(size=required_dim, distance=Distance.COSINE)
                 )
-                logger.info(f"✅ Recreated collection '{collection_name}' with dim {EMBEDDING_DIM}")
+                logger.info(f"✅ Recreated collection '{collection_name}' with dim {required_dim}")
         except Exception as dim_err:
             logger.warning(f"Could not verify/recreate collection dimension: {dim_err}")
         
