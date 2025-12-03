@@ -5,7 +5,7 @@ pyspellchecker>=0.7.2
 google-generativeai>=0.3.0
 qdrant-client>=1.7.0
 python-dotenv>=1.0.0
-numpy>=1.24.0
+numpy==1.26.4
 PyPDF2>=3.0.0
 opencv-python-headless>=4.8.0
 google-cloud-translate>=3.11.0
