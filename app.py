@@ -129,12 +129,29 @@ def get_embedding_model():
     Also determine embedding dimension dynamically and cache it in session state.
     """
     logger.info("🧠 Initializing embedding model...")
-    supported = []
+    supported_raw = []
     try:
-        supported = TextEmbedding.list_supported_models()
-        logger.info(f"📋 FastEmbed supported models: {supported}")
+        supported_raw = TextEmbedding.list_supported_models()
+        logger.info(f"📋 FastEmbed supported models: {supported_raw}")
     except Exception as e:
         logger.warning(f"⚠️ Could not list supported FastEmbed models: {e}")
+        supported_raw = []
+    # Normalize to a clean list of strings
+    supported = []
+    try:
+        iterable = supported_raw if isinstance(supported_raw, (list, tuple)) else []
+        for item in iterable:
+            name = None
+            if isinstance(item, str):
+                name = item
+            elif isinstance(item, dict):
+                name = item.get('name') or item.get('model_name') or str(item)
+            else:
+                name = str(item)
+            if isinstance(name, str) and name.strip():
+                supported.append(name.strip())
+    except Exception as norm_err:
+        logger.debug(f"⚠️ Failed to normalize supported models: {norm_err}")
         supported = []
 
     # Preference order (we'll match by exact name first, then substring)
@@ -150,13 +167,15 @@ def get_embedding_model():
     if supported:
         # Exact match
         for p in preferences:
-            if any(m.lower() == p.lower() for m in supported):
-                chosen = next(m for m in supported if m.lower() == p.lower())
+            pl = p.lower()
+            if any((m or '').lower() == pl for m in supported):
+                chosen = next(m for m in supported if (m or '').lower() == pl)
                 break
         # Substring match
         if not chosen:
             for p in preferences:
-                matches = [m for m in supported if p.lower() in m.lower()]
+                pl = p.lower()
+                matches = [m for m in supported if pl in (m or '').lower()]
                 if matches:
                     chosen = matches[0]
                     break
