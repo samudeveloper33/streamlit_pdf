@@ -16,6 +16,11 @@ warnings.filterwarnings("ignore", message=".*mean pooling instead of CLS embeddi
 os.environ['GLOG_minloglevel'] = '2'  # Suppress Google logging (0=INFO, 1=WARNING, 2=ERROR)
 os.environ['FLAGS_print_model_net_proto'] = '0'  # Suppress Paddle model printing
 
+# Stability flags (Cloud): limit threads and disable oneDNN to avoid kernel issues
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('FLAGS_use_mkldnn', '0')
+
 # PDF and Image Processing
 from pdf2image import convert_from_path
 from PIL import Image
@@ -53,13 +58,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure API keys
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_URL = os.getenv("QDRANT_URL")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Configure API keys (Cloud-safe: use Streamlit secrets first, then env vars)
+QDRANT_API_KEY = st.secrets.get("QDRANT_API_KEY", os.getenv("QDRANT_API_KEY"))
+QDRANT_URL = st.secrets.get("QDRANT_URL", os.getenv("QDRANT_URL"))
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
 
 # Global constants
 COLLECTION_NAME = ""
+EMBEDDING_DIM = 384
 
 # Global locks for thread safety
 ocr_lock = threading.Lock()
@@ -105,7 +111,7 @@ def get_paddle_ocr():
     logger.info("🤖 Initializing PaddleOCR (Tamil + English)...")
     try:
         ocr = PaddleOCR(
-            use_textline_orientation=True, 
+            use_angle_cls=True,
             lang='ta'
         )
         logger.info("✅ PaddleOCR initialized successfully.")
@@ -124,16 +130,16 @@ def get_embedding_model():
     logger.info("🧠 Initializing embedding model...")
     try:
         # Use FastEmbed for faster inference with correct model name
-        model = TextEmbedding(model_name="intfloat/multilingual-e5-large")
-        logger.info("✅ FastEmbed model (intfloat/multilingual-e5-large) loaded successfully")
+        model = TextEmbedding(model_name="intfloat/multilingual-e5-small")
+        logger.info("✅ FastEmbed model (intfloat/multilingual-e5-small) loaded successfully")
         return model
     except Exception as e:
         logger.error(f"❌ FastEmbed model loading failed: {str(e)}")
         logger.info("⚠️ Attempting to load alternative multilingual model...")
         try:
-            # Fallback to paraphrase-multilingual-mpnet-base-v2
-            model = TextEmbedding(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
-            logger.info("✅ Alternative model loaded: paraphrase-multilingual-mpnet-base-v2")
+            # Fallback to multilingual-e5-base (smaller than large)
+            model = TextEmbedding(model_name="intfloat/multilingual-e5-base")
+            logger.info("✅ Alternative model loaded: intfloat/multilingual-e5-base")
             return model
         except Exception as fallback_error:
             logger.error(f"❌ Alternative model also failed: {str(fallback_error)}")
@@ -975,7 +981,7 @@ def generate_embedding(text: str, task_type: str = "retrieval_document") -> List
         return None
 
 
-def create_qdrant_collection(dimension: int = 1024):
+def create_qdrant_collection(dimension: int = EMBEDDING_DIM):
     """Create Qdrant collection if it doesn't exist.
     
     Note: FastEmbed intfloat/multilingual-e5-large produces 1024-dimensional embeddings.
@@ -1057,7 +1063,7 @@ def store_in_qdrant(pdf_name: str, page_number: int, clean_text: str, embedding:
             qdrant_client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
-                    size=1024,  # Dimension of the FastEmbed model
+                    size=EMBEDDING_DIM,
                     distance=Distance.COSINE
                 )
             )
@@ -1071,6 +1077,21 @@ def store_in_qdrant(pdf_name: str, page_number: int, clean_text: str, embedding:
                 # For any other error, we re-raise it to be handled.
                 raise e
         logger.info(f"✅ Collection '{collection_name}' is ready.")
+        
+        # Ensure collection vector size matches embedding dimension
+        try:
+            info = qdrant_client.get_collection(collection_name)
+            existing_dim = info.config.params.vectors.size
+            if existing_dim != EMBEDDING_DIM:
+                logger.warning(f"⚠️ Dimension mismatch in '{collection_name}': {existing_dim} -> {EMBEDDING_DIM}. Recreating collection.")
+                qdrant_client.delete_collection(collection_name)
+                qdrant_client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
+                )
+                logger.info(f"✅ Recreated collection '{collection_name}' with dim {EMBEDDING_DIM}")
+        except Exception as dim_err:
+            logger.warning(f"Could not verify/recreate collection dimension: {dim_err}")
         
         # Generate truly unique point ID using UUID based on page number
         import uuid
